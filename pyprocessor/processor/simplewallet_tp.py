@@ -1,43 +1,39 @@
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ------------------------------------------------------------------------------
 '''
-Transaction family class for simplewallet.
+Transaction family class for blockbee.
 '''
 
 import traceback
 import sys
 import hashlib
 import logging
+import json
+import base64
 
 from sawtooth_sdk.processor.handler import TransactionHandler
 from sawtooth_sdk.processor.exceptions import InvalidTransaction
 from sawtooth_sdk.processor.exceptions import InternalError
 from sawtooth_sdk.processor.core import TransactionProcessor
 
+from sawtooth_signing import create_context
+from sawtooth_signing import CryptoFactory
+from sawtooth_signing import ParseError
+from sawtooth_signing.secp256k1 import Secp256k1PrivateKey
+
+
 LOGGER = logging.getLogger(__name__)
 
-FAMILY_NAME = "simplewallet"
+FAMILY_NAME = "blockbee"
 
 def _hash(data):
     '''Compute the SHA-512 hash and return the result as hex characters.'''
     return hashlib.sha512(data).hexdigest()
 
-# Prefix for simplewallet is the first six hex digits of SHA-512(TF name).
+# Prefix for blockbee is the first six hex digits of SHA-512(TF name).
 sw_namespace = _hash(FAMILY_NAME.encode('utf-8'))[0:6]
 
-class SimpleWalletTransactionHandler(TransactionHandler):
+class blockbeeTransactionHandler(TransactionHandler):
     '''                                                       
-    Transaction Processor class for the simplewallet transaction family.       
+    Transaction Processor class for the blockbee transaction family.       
                                                               
     This with the validator using the accept/get/set functions.
     It implements functions to deposit, withdraw, and transfer money.
@@ -62,128 +58,146 @@ class SimpleWalletTransactionHandler(TransactionHandler):
         '''This implements the apply function for this transaction handler.
                                                               
            This function does most of the work for this class by processing
-           a single transaction for the simplewallet transaction family.   
+           a single transaction for the blockbee transaction family.   
         '''                                                   
         
-        # Get the payload and extract simplewallet-specific information.
+        # Get the payload and extract blockbee-specific information.
         header = transaction.header
         payload_list = transaction.payload.decode().split(",")
         operation = payload_list[0]
-        amount = payload_list[1]
+        
+        edgehost = header.signer_public_key
 
-        # Get the public key sent from the client.
-        from_key = header.signer_public_key
-
-        # Perform the operation.
         LOGGER.info("Operation = "+ operation)
 
-        if operation == "deposit":
-            self._make_deposit(context, amount, from_key)
-        elif operation == "withdraw":
-            self._make_withdraw(context, amount, from_key)
-        elif operation == "transfer":
-            if len(payload_list) == 3:
-                to_key = payload_list[2]
-            self._make_transfer(context, amount, to_key, from_key)
+        # format of operation set flow for device
+        # setflow UserA Password1 EdgeUIT
+        if operation == "setflow":
+            if len(payload_list) == 4:
+                userhost = payload_list[1] # username or edge(init_database)
+                LOGGER.info('userhost {}'.format(userhost))
+                passhost = payload_list[2] # password
+                LOGGER.info('userhost {}'.format(passhost))
+            # def _setflow(self, context, username, password, edgehost)
+            self._setflow(self, context, userhost, passhost, edgehost)
+        elif operation == "add_device":
+            if len(payload_list) == 4:
+                userhost = payload_list[1] # username or edge(init_database)
+                LOGGER.info('userhost {}'.format(userhost))
+                passhost = payload_list[2] # password
+                LOGGER.info('userhost {}'.format(passhost))
+            # _add_device(self, context, username, password, edgehost)
+            self._add_device(self, context, userhost, passhost, edgehost)
+        elif operation == "init_edge":
+            # _init_edge(self, context, edgehost)
+            self._init_edge(self, context, edgehost)
         else:
             LOGGER.info("Unhandled action. " +
-                "Operation should be deposit, withdraw or transfer")
+                "Operation should be setflow, add_device or init_edge")
 
-    def _make_deposit(self, context, amount, from_key):
-        wallet_address = self._get_wallet_address(from_key)
-        LOGGER.info('Got the key {} and the wallet address {} '.format(
-            from_key, wallet_address))
-        current_entry = context.get_state([wallet_address])
-        new_balance = 0
+    def _setflow(self, context, username, password, edgehost):
+        '''This function will authenticate for smart device. Then call rest api of controller to set flow direct for device'''
+        edge_address = self._get_object_address(edgehost)
+        current_entry = context.get_state(edge_address)
 
         if current_entry == []:
-            LOGGER.info('No previous deposits, creating new deposit {} '
-                .format(from_key))
-            new_balance = int(amount)
-        else:
-            balance = int(current_entry[0].data)
-            new_balance = int(amount) + int(balance)
-
-        state_data = str(new_balance).encode('utf-8')
-        addresses = context.set_state({wallet_address: state_data})
-
-        if len(addresses) < 1:
+            LOGGER.info('[!] Edge host invalid')
             raise InternalError("State Error")
-
-    def _make_withdraw(self, context, amount, from_key):
-        wallet_address = self._get_wallet_address(from_key)
-        LOGGER.info('Got the key {} and the wallet address {} '.format(
-            from_key, wallet_address))
-        current_entry = context.get_state([wallet_address])
-        new_balance = 0
-
-        if current_entry == []:
-            LOGGER.info('No user with the key {} '.format(from_key))
         else:
-            balance = int(current_entry[0].data)
-            if balance < int(amount):
-                raise InvalidTransaction('Not enough money. The amount ' +
-                    'should be lesser or equal to {} '.format(balance))
+            LOGGER.info('[+] Edge host valid at address {}'.format(edge_address))
+            #database mapping with edge host have structure
+            # database = {
+            #     "alice" :   "55205894fa7fd2e8017492d113c2317f92824f"
+            #     "bob"   :   "55205894fa7fd2e8017492d113c2317f92824f"
+            # }
+            # database save with str(dumpdata).encode('utf-8')
+            # to decrypt after query, we can
+            # jsondata = json.loads(querydata.decode('utf-8'))
+            get_data_node = current_entry[0].data   # str data encode utf 8
+            json_data = json.loads(get_data_node.decode('utf-8'))
+
+            passhash = _hash(password.encode('utf-8'))
+            if json_data[username] == passhash:
+                #call_rest_api(username)
+                LOGGER.info('[+] Authentication success. Sending ACL to controller')
             else:
-                new_balance = balance - int(amount)
+                LOGGER.info('[-] Username or password incorrect')
+                raise InternalError("State Error")
 
-        LOGGER.info('Withdrawing {} '.format(amount))
-        state_data = str(new_balance).encode('utf-8')
-        addresses = context.set_state(
-            {self._get_wallet_address(from_key): state_data})
-
-        if len(addresses) < 1:
-            raise InternalError("State Error")
-
-    def _make_transfer(self, context, transfer_amount, to_key, from_key):
-        transfer_amount = int(transfer_amount)
-        if transfer_amount <= 0:
-            raise InvalidTransaction("The amount cannot be <= 0")
-
-        wallet_address = self._get_wallet_address(from_key)
-        wallet_to_address = self._get_wallet_address(to_key)
-        LOGGER.info('Got the from key {} and the from wallet address {} '.format(
-            from_key, wallet_address))
-        LOGGER.info('Got the to key {} and the to wallet address {} '.format(
-            to_key, wallet_to_address))
-        current_entry = context.get_state([wallet_address])
-        current_entry_to = context.get_state([wallet_to_address])
-        new_balance = 0
+    def _add_device(self, context, username, password, edgehost):
+        edge_address = self._get_object_address(edgehost)
+        current_entry = context.get_state(edge_address)
 
         if current_entry == []:
-            LOGGER.info('No user (debtor) with the key {} '.format(from_key))
-        if current_entry_to == []:
-            LOGGER.info('No user (creditor) with the key {} '.format(to_key))
-
-        balance = int(current_entry[0].data)
-        balance_to = int(current_entry_to[0].data)
-        if balance < transfer_amount:
-            raise InvalidTransaction('Not enough money. ' +
-                'The amount should be less or equal to {} '.format(balance))
+            LOGGER.info('[!] Edge host invalid')
+            raise InternalError("State Error")
         else:
-            LOGGER.info("Debiting balance with {}".format(transfer_amount))
-            update_debtor_balance = balance - int(transfer_amount)
-            state_data = str(update_debtor_balance).encode('utf-8')
-            context.set_state({wallet_address: state_data})
-            update_beneficiary_balance = balance_to + int(transfer_amount)
-            state_data = str(update_beneficiary_balance).encode('utf-8')
-            context.set_state({wallet_to_address: state_data})
+            #database mapping with edge host have structure
+            # database = {
+            #     "alice" :   "55205894fa7fd2e8017492d113c2317f92824f"
+            #     "bob"   :   "55205894fa7fd2e8017492d113c2317f92824f"
+            # }
+            # database save with str(dumpdata).encode('utf-8')
+            # to decrypt after query, we can
+            # jsondata = json.loads(querydata.decode('utf-8'))
+            LOGGER.info('[+] Edge host valid at address {}'.format(edge_address))
+            
+            get_data_node = current_entry[0].data   # str data encode utf 8
+            json_data = json.loads(get_data_node.decode('utf-8'))
 
-    def _get_wallet_address(self, from_key):
+            passhash = _hash(password.encode('utf-8'))
+            
+            #init new data which udpate to database
+            add_data = {
+                username : passhash
+            }
+            json_data.update(add_data)
+
+            new_data = json.dumps(json_data).encode('utf-8')
+            addresses = context.set_state({edge_address: new_data})
+            
+            if len(addresses) < 1:
+                raise InternalError("State Error")
+
+    def _init_edge(self, context, edgehost):
+        '''
+        This funtion use to init database of edge device to test
+        '''
+        edge_address = self._get_object_address(edgehost)
+        current_entry = context.get_state(edge_address)
+
+        if current_entry == []:
+            LOGGER('[+] init new_data for {}'.format(edgehost))
+            init_data = {
+                "test" : "test"
+            }
+
+            str_data = json.dumps(init_data)
+            state_data = str_data.encode('utf-8')
+            addresses = context.set_state({edge_address: state_data})
+
+            if len(addresses) < 1:
+                raise InternalError("State Error")
+        else:
+            LOGGER.info('[!] database existed')
+            raise InternalError("State Error")
+
+    def _get_object_address(self, from_key):
         return _hash(FAMILY_NAME.encode('utf-8'))[0:6] + _hash(from_key.encode('utf-8'))[0:64]
+
 
 def setup_loggers():
     logging.basicConfig()
     logging.getLogger().setLevel(logging.DEBUG)
 
 def main():
-    '''Entry-point function for the simplewallet transaction processor.'''
+    '''Entry-point function for the blockbee transaction processor.'''
     setup_loggers()
     try:
         # Register the transaction handler and start it.
         processor = TransactionProcessor(url='tcp://validator:4004')
 
-        handler = SimpleWalletTransactionHandler(sw_namespace)
+        handler = blockbeeTransactionHandler(sw_namespace)
 
         processor.add_handler(handler)
 
@@ -196,4 +210,3 @@ def main():
     except BaseException as err:
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
-
